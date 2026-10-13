@@ -5,15 +5,6 @@ import android.content.Intent
 import androidx.core.content.FileProvider
 import java.io.File
 
-/**
- * Solves the problem: "What if the other person's phone doesn't have the app installed
- * and we have no internet?"
- *
- * Every installed Android app keeps its base APK at [context.applicationInfo.sourceDir].
- * This utility copies the running APK into a shareable cache file and launches Android's
- * native Bluetooth / Quick Share sheet so you can beam the installer `.apk` directly
- * to another Android phone completely offline!
- */
 object OfflineApkSharer {
 
     fun shareInstalledApkOffline(context: Context) {

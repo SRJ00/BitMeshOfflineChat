@@ -5,9 +5,9 @@
     <!-- Required for BLE Mesh Networking -->
     <uses-feature android:name="android.hardware.bluetooth_le" android:required="true" />
 
-    <!-- Legacy Bluetooth Permissions (Android 8.0 - 11) -->
-    <uses-permission android:name="android.permission.BLUETOOTH" android:maxSdkVersion="30" />
-    <uses-permission android:name="android.permission.BLUETOOTH_ADMIN" android:maxSdkVersion="30" />
+    <!-- Legacy Bluetooth Permissions (Valid on all API levels so BluetoothAdapter.isEnabled works reliably across OEM ROMs) -->
+    <uses-permission android:name="android.permission.BLUETOOTH" />
+    <uses-permission android:name="android.permission.BLUETOOTH_ADMIN" />
     <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
     <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
 
@@ -27,11 +27,12 @@
         android:allowBackup="false"
         android:label="BitMesh Offline"
         android:supportsRtl="true"
-        android:theme="@android:style/Theme.Material.Light.NoActionBar">
+        android:theme="@android:style/Theme.Material.NoActionBar">
 
         <activity
             android:name=".ui.MainActivity"
-            android:exported="true">
+            android:exported="true"
+            android:windowSoftInputMode="adjustResize">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />

@@ -1,12 +1,18 @@
 package com.bitmesh.offlinechat.mesh
 
+import android.Manifest
 import android.annotation.SuppressLint
 import android.bluetooth.*
 import android.bluetooth.le.*
+import android.content.BroadcastReceiver
 import android.content.Context
+import android.content.Intent
+import android.content.IntentFilter
+import android.content.pm.PackageManager
 import android.os.Build
 import android.os.ParcelUuid
 import android.util.Log
+import androidx.core.content.ContextCompat
 import com.bitmesh.offlinechat.crypto.CryptoEngine
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -41,12 +47,12 @@ data class ChatMessage(
 /**
  * Dual-Role Android BLE Mesh Engine (GATT Server + GATT Client + Multi-Hop Relay + Store-and-Forward).
  *
- * How messages travel long distances without internet:
- * 1. Multi-Hop Relay (TTL up to 7): Every phone running BitMesh relays unseen packets to all connected peers.
- * 2. Store-and-Forward ("Data Mule"): Encrypted direct messages for offline/distant peers are cached in
- *    [storeAndForwardOutbox]. When any node encounters the target peer (or a new node joins the mesh),
- *    cached encrypted envelopes are automatically replayed and delivered.
- * 3. BLE 5.0 Coded PHY (Long Range): Uses LE Coded PHY when supported by the Android handset for up to 4x range.
+ * Fixes included in v1.1:
+ * 1. Removed android:maxSdkVersion="30" from BLUETOOTH & BLUETOOTH_ADMIN in AndroidManifest.xml so
+ *    BluetoothAdapter.isEnabled never throws a SecurityException or returns false on Android 12+ OEM ROMs.
+ * 2. Listens to BluetoothAdapter.ACTION_STATE_CHANGED and runs a 3-second watchdog coroutine so
+ *    the mesh starts automatically as soon as permissions are granted or Bluetooth is toggled on.
+ * 3. Includes standard Client Characteristic Configuration Descriptor (0x2902) for reliable bidirectional GATT notifications.
  */
 @SuppressLint("MissingPermission")
 class BleMeshManager(
@@ -58,22 +64,31 @@ class BleMeshManager(
         private const val TAG = "BleMeshManager"
         val MESH_SERVICE_UUID: UUID = UUID.fromString("b17c4a70-0001-4000-8000-00805f9b34fb")
         val PACKET_CHAR_UUID: UUID = UUID.fromString("b17c4a70-0002-4000-8000-00805f9b34fb")
+        val CCCD_UUID: UUID = UUID.fromString("00002902-0000-1000-8000-00805f9b34fb")
         private const val MAX_SEEN_PACKETS = 2048
         private const val MAX_OUTBOX_PACKETS = 256
     }
 
     private val bluetoothManager = context.getSystemService(Context.BLUETOOTH_SERVICE) as BluetoothManager
-    private val bluetoothAdapter: BluetoothAdapter? = bluetoothManager.adapter
+    private val bluetoothAdapter: BluetoothAdapter?
+        get() = bluetoothManager.adapter
+
     private var gattServer: BluetoothGattServer? = null
     private var advertiser: BluetoothLeAdvertiser? = null
     private var scanner: BluetoothLeScanner? = null
 
+    @Volatile
+    private var isAdvertising = false
+    @Volatile
+    private var isScanning = false
+    @Volatile
+    private var isReceiverRegistered = false
+
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val secureRandom = SecureRandom()
 
-    // Deduplication LRU cache of packetIds to prevent infinite broadcast loops
     private val seenPacketIds = Collections.synchronizedSet(
-         object : LinkedHashSet<Long>(MAX_SEEN_PACKETS) {
+        object : LinkedHashSet<Long>(MAX_SEEN_PACKETS) {
             override fun add(element: Long): Boolean {
                 if (size >= MAX_SEEN_PACKETS) {
                     val it = iterator()
@@ -87,10 +102,7 @@ class BleMeshManager(
         }
     )
 
-    // Store-and-Forward Outbox: holds encrypted packets for distant/offline recipients ("Data Mule" mode)
     private val storeAndForwardOutbox = ConcurrentHashMap<Long, MeshPacket>()
-
-    // Active GATT client connections by device address
     private val activeGattClients = ConcurrentHashMap<String, BluetoothGatt>()
     private val connectedServerDevices = ConcurrentHashMap<String, BluetoothDevice>()
 
@@ -100,51 +112,136 @@ class BleMeshManager(
     private val _messages = MutableStateFlow<List<ChatMessage>>(emptyList())
     val messages: StateFlow<List<ChatMessage>> = _messages
 
-    private val _meshStats = MutableStateFlow("Idle")
+    private val _meshStats = MutableStateFlow("Initializing BLE Mesh...")
     val meshStats: StateFlow<String> = _meshStats
 
-    fun startMesh() {
-        if (bluetoothAdapter == null || !bluetoothAdapter.isEnabled) {
-            _meshStats.value = "Bluetooth is disabled — please enable Bluetooth"
-            return
-        }
-        startGattServer()
-        startAdvertising()
-        startScanning()
-
-        // Periodically announce our X25519/EC public key & flush Store-and-Forward outbox to new peers
-        scope.launch {
-            while (isActive) {
-                broadcastKeyAnnouncement()
-                delay(15_000L)
+    private val bluetoothStateReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context?, intent: Intent?) {
+            if (intent?.action == BluetoothAdapter.ACTION_STATE_CHANGED) {
+                val state = intent.getIntExtra(BluetoothAdapter.EXTRA_STATE, BluetoothAdapter.ERROR)
+                if (state == BluetoothAdapter.STATE_ON) {
+                    startMesh()
+                } else if (state == BluetoothAdapter.STATE_OFF) {
+                    isAdvertising = false
+                    isScanning = false
+                    _meshStats.value = "Bluetooth is turned off"
+                }
             }
         }
-        _meshStats.value = "Mesh Active • Node ${cryptoEngine.shortFingerprintHex()}"
+    }
+
+    init {
+        registerBluetoothStateReceiver()
+        // Watchdog loop: automatically recovers as soon as permissions are granted or Bluetooth turns on
+        scope.launch {
+            while (isActive) {
+                if (!isAdvertising || !isScanning || gattServer == null) {
+                    ensureMeshRunning()
+                } else {
+                    broadcastKeyAnnouncement()
+                }
+                delay(4_000L)
+            }
+        }
+    }
+
+    private fun registerBluetoothStateReceiver() {
+        if (!isReceiverRegistered) {
+            runCatching {
+                context.registerReceiver(
+                    bluetoothStateReceiver,
+                    IntentFilter(BluetoothAdapter.ACTION_STATE_CHANGED)
+                )
+                isReceiverRegistered = true
+            }
+        }
+    }
+
+    fun hasRequiredPermissions(): Boolean {
+        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            ContextCompat.checkSelfPermission(context, Manifest.permission.BLUETOOTH_SCAN) == PackageManager.PERMISSION_GRANTED &&
+            ContextCompat.checkSelfPermission(context, Manifest.permission.BLUETOOTH_ADVERTISE) == PackageManager.PERMISSION_GRANTED &&
+            ContextCompat.checkSelfPermission(context, Manifest.permission.BLUETOOTH_CONNECT) == PackageManager.PERMISSION_GRANTED
+        } else {
+            ContextCompat.checkSelfPermission(context, Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED ||
+            ContextCompat.checkSelfPermission(context, Manifest.permission.ACCESS_COARSE_LOCATION) == PackageManager.PERMISSION_GRANTED
+        }
+    }
+
+    fun startMesh() {
+        scope.launch {
+            ensureMeshRunning()
+        }
+    }
+
+    @Synchronized
+    private fun ensureMeshRunning() {
+        val adapter = bluetoothAdapter
+        if (adapter == null) {
+            _meshStats.value = "No Bluetooth hardware found"
+            return
+        }
+        if (!hasRequiredPermissions()) {
+            _meshStats.value = "Grant 'Nearby Devices' permission to start"
+            return
+        }
+        val enabled = runCatching { adapter.isEnabled || adapter.state == BluetoothAdapter.STATE_ON }.getOrDefault(false)
+        if (!enabled) {
+            _meshStats.value = "Bluetooth is off — tap Refresh after enabling"
+            return
+        }
+
+        if (gattServer == null) {
+            runCatching { startGattServer() }
+        }
+        if (!isAdvertising) {
+            runCatching { startAdvertising() }
+        }
+        if (!isScanning) {
+            runCatching { startScanning() }
+        }
+
+        _meshStats.value = "Online • ID ${cryptoEngine.shortFingerprintHex().take(6)}"
+        broadcastKeyAnnouncement()
     }
 
     fun stopMesh() {
+        if (isReceiverRegistered) {
+            runCatching { context.unregisterReceiver(bluetoothStateReceiver) }
+            isReceiverRegistered = false
+        }
         runCatching { advertiser?.stopAdvertising(advertiseCallback) }
         runCatching { scanner?.stopScan(scanCallback) }
+        isAdvertising = false
+        isScanning = false
         activeGattClients.values.forEach { runCatching { it.close() } }
         activeGattClients.clear()
         runCatching { gattServer?.close() }
+        gattServer = null
         scope.cancel()
         _meshStats.value = "Mesh Stopped"
     }
 
     private fun startGattServer() {
-        gattServer = bluetoothManager.openGattServer(context, gattServerCallback)
+        val server = bluetoothManager.openGattServer(context, gattServerCallback) ?: return
         val service = BluetoothGattService(MESH_SERVICE_UUID, BluetoothGattService.SERVICE_TYPE_PRIMARY)
         val packetCharacteristic = BluetoothGattCharacteristic(
             PACKET_CHAR_UUID,
             BluetoothGattCharacteristic.PROPERTY_WRITE or
                     BluetoothGattCharacteristic.PROPERTY_WRITE_NO_RESPONSE or
-                    BluetoothGattCharacteristic.PROPERTY_NOTIFY,
+                    BluetoothGattCharacteristic.PROPERTY_NOTIFY or
+                    BluetoothGattCharacteristic.PROPERTY_READ,
             BluetoothGattCharacteristic.PERMISSION_WRITE or
                     BluetoothGattCharacteristic.PERMISSION_READ
         )
+        val cccd = BluetoothGattDescriptor(
+            CCCD_UUID,
+            BluetoothGattDescriptor.PERMISSION_READ or BluetoothGattDescriptor.PERMISSION_WRITE
+        )
+        packetCharacteristic.addDescriptor(cccd)
         service.addCharacteristic(packetCharacteristic)
-        gattServer?.addService(service)
+        server.addService(service)
+        gattServer = server
     }
 
     private fun startAdvertising() {
@@ -169,22 +266,14 @@ class BleMeshManager(
             .setServiceUuid(ParcelUuid(MESH_SERVICE_UUID))
             .build()
 
-        val settingsBuilder = ScanSettings.Builder()
+        val settings = ScanSettings.Builder()
             .setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY)
+            .build()
 
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O &&
-            bluetoothAdapter?.isLeCodedPhySupported == true
-        ) {
-            settingsBuilder.setLegacy(false)
-            settingsBuilder.setPhy(ScanSettings.PHY_LE_ALL_SUPPORTED)
-        }
-
-        scanner?.startScan(listOf(filter), settingsBuilder.build(), scanCallback)
+        scanner?.startScan(listOf(filter), settings, scanCallback)
+        isScanning = true
     }
 
-    /**
-     * Broadcasts our public key + nickname so nearby or multi-hop peers can establish E2EE sessions.
-     */
     fun broadcastKeyAnnouncement() {
         val nickBytes = myNickname.toByteArray(Charsets.UTF_8)
         val pubKey = cryptoEngine.myPublicKeyBytes
@@ -205,9 +294,6 @@ class BleMeshManager(
         transmitPacketToAllPeers(packet)
     }
 
-    /**
-     * Sends an AES-256-GCM encrypted message to a public/password-protected #channel.
-     */
     fun sendChannelMessage(channel: String, text: String, channelPassword: String = "") {
         val packetId = secureRandom.nextLong()
         val tempPacket = MeshPacket(
@@ -239,11 +325,6 @@ class BleMeshManager(
         transmitPacketToAllPeers(finalPacket)
     }
 
-    /**
-     * Sends an End-to-End Encrypted Direct Message (ECDH + HKDF-SHA256 + AES-256-GCM)
-     * and caches it in the Store-and-Forward Outbox so intermediate nodes ("data mules")
-     * can carry and deliver it across physical gaps.
-     */
     fun sendDirectEncryptedMessage(recipientId: Long, text: String) {
         val peer = _peers.value[recipientId] ?: return
         val sharedKey = cryptoEngine.deriveSharedAeadKey(peer.publicKeyBytes)
@@ -287,7 +368,7 @@ class BleMeshManager(
     private fun onPacketReceived(rawBytes: ByteArray, rssi: Int) {
         val packet = MeshPacket.fromBytes(rawBytes) ?: return
         if (!seenPacketIds.add(packet.packetId)) {
-            return // Already processed/relayed this packetId
+            return
         }
 
         when (packet.packetType) {
@@ -301,11 +382,9 @@ class BleMeshManager(
             }
             MeshPacket.TYPE_DIRECT_E2EE_MSG -> {
                 if (packet.recipientId == cryptoEngine.myNodeId) {
-                    // Addressed to us! Decrypt with ECDH + AES-256-GCM
                     handleDirectMessageForMe(packet)
                     sendDeliveryAck(packet.packetId, packet.senderId)
                 } else {
-                    // Not for us: store in Store-and-Forward cache & relay to extend distance!
                     if (storeAndForwardOutbox.size < MAX_OUTBOX_PACKETS) {
                         storeAndForwardOutbox[packet.packetId] = packet
                     }
@@ -346,7 +425,6 @@ class BleMeshManager(
                 )
                 _peers.value = updated
 
-                // Replay any Store-and-Forward packets waiting in outbox!
                 storeAndForwardOutbox.values.forEach { queued ->
                     transmitPacketToAllPeers(queued)
                 }
@@ -425,7 +503,6 @@ class BleMeshManager(
 
     private fun transmitPacketToAllPeers(packet: MeshPacket) {
         val raw = packet.toBytes()
-        // 1. Write to all connected GATT servers where we are client
         activeGattClients.values.forEach { gatt ->
             val service = gatt.getService(MESH_SERVICE_UUID)
             val char = service?.getCharacteristic(PACKET_CHAR_UUID)
@@ -435,7 +512,6 @@ class BleMeshManager(
                 runCatching { gatt.writeCharacteristic(char) }
             }
         }
-        // 2. Notify all connected GATT clients where we are server
         val serverChar = gattServer
             ?.getService(MESH_SERVICE_UUID)
             ?.getCharacteristic(PACKET_CHAR_UUID)
@@ -449,9 +525,12 @@ class BleMeshManager(
 
     private val advertiseCallback = object : AdvertiseCallback() {
         override fun onStartSuccess(settingsInEffect: AdvertiseSettings?) {
+            isAdvertising = true
+            _meshStats.value = "Online • ID ${cryptoEngine.shortFingerprintHex().take(6)}"
             Log.d(TAG, "BLE Mesh Advertising active")
         }
         override fun onStartFailure(errorCode: Int) {
+            isAdvertising = false
             Log.w(TAG, "BLE Advertise failed: $errorCode")
         }
     }
@@ -466,6 +545,11 @@ class BleMeshManager(
                     activeGattClients[address] = gatt
                 }
             }
+        }
+
+        override fun onScanFailed(errorCode: Int) {
+            isScanning = false
+            Log.w(TAG, "BLE Scan failed: $errorCode")
         }
     }
 
@@ -488,6 +572,11 @@ class BleMeshManager(
                 val char = gatt.getService(MESH_SERVICE_UUID)?.getCharacteristic(PACKET_CHAR_UUID)
                 if (char != null) {
                     gatt.setCharacteristicNotification(char, true)
+                    val descriptor = char.getDescriptor(CCCD_UUID)
+                    if (descriptor != null) {
+                        descriptor.value = BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
+                        runCatching { gatt.writeDescriptor(descriptor) }
+                    }
                     broadcastKeyAnnouncement()
                 }
             }
@@ -507,8 +596,23 @@ class BleMeshManager(
         override fun onConnectionStateChange(device: BluetoothDevice, status: Int, newState: Int) {
             if (newState == BluetoothProfile.STATE_CONNECTED) {
                 connectedServerDevices[device.address] = device
+                broadcastKeyAnnouncement()
             } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
                 connectedServerDevices.remove(device.address)
+            }
+        }
+
+        override fun onDescriptorWriteRequest(
+            device: BluetoothDevice,
+            requestId: Int,
+            descriptor: BluetoothGattDescriptor,
+            preparedWrite: Boolean,
+            responseNeeded: Boolean,
+            offset: Int,
+            value: ByteArray?
+        ) {
+            if (responseNeeded) {
+                gattServer?.sendResponse(device, requestId, BluetoothGatt.GATT_SUCCESS, 0, null)
             }
         }
 

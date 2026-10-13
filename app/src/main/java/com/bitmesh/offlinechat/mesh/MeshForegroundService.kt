@@ -9,10 +9,6 @@ import android.os.Binder
 import android.os.IBinder
 import com.bitmesh.offlinechat.crypto.CryptoEngine
 
-/**
- * Foreground Service keeping the BLE Mesh active so your phone continues relaying
- * encrypted multi-hop packets and Store-and-Forward messages even when the screen is off.
- */
 class MeshForegroundService : Service() {
 
     inner class LocalBinder : Binder() {
@@ -46,6 +42,13 @@ class MeshForegroundService : Service() {
         val crypto = CryptoEngine()
         bleMeshManager = BleMeshManager(applicationContext, crypto)
         bleMeshManager.startMesh()
+    }
+
+    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        if (::bleMeshManager.isInitialized) {
+            bleMeshManager.startMesh()
+        }
+        return START_STICKY
     }
 
     override fun onBind(intent: Intent?): IBinder = binder

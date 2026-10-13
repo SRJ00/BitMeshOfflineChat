@@ -17,7 +17,7 @@ import javax.crypto.spec.SecretKeySpec
  * End-to-End Encryption Engine for BitMesh Offline Chat.
  *
  * Implements:
- * 1. Elliptic-Curve Diffie-Hellman (ECDH / secp256r1 or X25519 on API 31+) Key Agreement
+ * 1. Elliptic-Curve Diffie-Hellman (ECDH / secp256r1) Key Agreement
  * 2. HKDF-SHA256 Key Derivation with context binding
  * 3. AES-256-GCM Authenticated Encryption with Associated Data (AEAD)
  *    - 96-bit (12-byte) cryptographic random IV per packet
@@ -36,10 +36,6 @@ class CryptoEngine {
     private val secureRandom = SecureRandom()
     val identityKeyPair: KeyPair = generateIdentityKeyPair()
 
-    /**
-     * Short 8-Byte Fingerprint ID derived from SHA-256(PublicKey)
-     * Used as compact senderId / recipientId inside BLE Mesh packets.
-     */
     val myNodeId: Long by lazy {
         deriveNodeIdFromPublicKey(identityKeyPair.public.encoded)
     }
@@ -62,10 +58,6 @@ class CryptoEngine {
         return java.lang.Long.toUnsignedString(nodeId, 16).uppercase().padStart(16, '0').take(8)
     }
 
-    /**
-     * Performs ECDH Key Agreement with a peer's X.509-encoded public key
-     * and derives a 256-bit AES-GCM session key via HKDF-SHA256.
-     */
     fun deriveSharedAeadKey(peerPublicKeyEncoded: ByteArray): SecretKeySpec {
         val keyFactory = KeyFactory.getInstance("EC")
         val peerPublicKey = keyFactory.generatePublic(X509EncodedKeySpec(peerPublicKeyEncoded))
@@ -75,15 +67,11 @@ class CryptoEngine {
         keyAgreement.doPhase(peerPublicKey, true)
         val rawSharedSecret = keyAgreement.generateSecret()
 
-        // HKDF-Extract & Expand using HMAC-SHA256
         val prk = hmacSha256(ByteArray(32) { 0 }, rawSharedSecret)
         val okm = hmacSha256(prk, HKDF_INFO.toByteArray(Charsets.UTF_8) + byteArrayOf(0x01))
         return SecretKeySpec(okm, 0, 32, "AES")
     }
 
-    /**
-     * Derives a 256-bit symmetric key for a public or password-protected #channel.
-     */
     fun deriveChannelKey(channelName: String, password: String = ""): SecretKeySpec {
         val salt = MessageDigest.getInstance("SHA-256")
             .digest("BitMesh-Channel-$channelName".toByteArray(Charsets.UTF_8))
@@ -93,11 +81,6 @@ class CryptoEngine {
         return SecretKeySpec(keyBytes, "AES")
     }
 
-    /**
-     * Encrypts plaintext with AES-256-GCM.
-     * Output format: [12-byte IV] + [Ciphertext + 16-byte GCM Auth Tag]
-     * Intermediate Bluetooth relay nodes without the key cannot decrypt or modify the message.
-     */
     fun encryptAead(
         plaintext: ByteArray,
         secretKey: SecretKeySpec,
@@ -120,10 +103,6 @@ class CryptoEngine {
         return output
     }
 
-    /**
-     * Decrypts and verifies AES-256-GCM payload.
-     * Throws GeneralSecurityException if tampered or wrong key.
-     */
     fun decryptAead(
         ivAndCiphertext: ByteArray,
         secretKey: SecretKeySpec,

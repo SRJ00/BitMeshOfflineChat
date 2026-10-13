@@ -1,6 +1,8 @@
 package com.bitmesh.offlinechat.ui
 
 import android.Manifest
+import android.bluetooth.BluetoothAdapter
+import android.bluetooth.BluetoothManager
 import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
@@ -12,7 +14,6 @@ import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
-import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
@@ -24,6 +25,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.bitmesh.offlinechat.mesh.BleMeshManager
@@ -40,6 +42,7 @@ class MainActivity : ComponentActivity() {
         override fun onServiceConnected(name: ComponentName?, service: IBinder?) {
             val binder = service as? MeshForegroundService.LocalBinder
             meshManager = binder?.meshManager
+            meshManager?.startMesh()
             isBound = true
         }
         override fun onServiceDisconnected(name: ComponentName?) {
@@ -48,10 +51,18 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    private val enableBtLauncher = registerForActivityResult(
+        ActivityResultContracts.StartActivityForResult()
+    ) {
+        meshManager?.startMesh()
+    }
+
     private val permissionLauncher = registerForActivityResult(
         ActivityResultContracts.RequestMultiplePermissions()
     ) {
         startAndBindMeshService()
+        promptEnableBluetoothIfNeeded()
+        meshManager?.startMesh()
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -75,10 +86,29 @@ class MainActivity : ComponentActivity() {
                     } else {
                         BitMeshScreen(
                             manager = manager,
+                            onRefreshMesh = {
+                                requestBlePermissions()
+                                manager.startMesh()
+                            },
                             onShareApk = { OfflineApkSharer.shareInstalledApkOffline(this) }
                         )
                     }
                 }
+            }
+        }
+    }
+
+    override fun onResume() {
+        super.onResume()
+        meshManager?.startMesh()
+    }
+
+    private fun promptEnableBluetoothIfNeeded() {
+        runCatching {
+            val bm = getSystemService(Context.BLUETOOTH_SERVICE) as BluetoothManager
+            val adapter = bm.adapter
+            if (adapter != null && !adapter.isEnabled) {
+                enableBtLauncher.launch(Intent(BluetoothAdapter.ACTION_REQUEST_ENABLE))
             }
         }
     }
@@ -112,7 +142,11 @@ class MainActivity : ComponentActivity() {
 }
 
 @Composable
-fun BitMeshScreen(manager: BleMeshManager, onShareApk: () -> Unit) {
+fun BitMeshScreen(
+    manager: BleMeshManager,
+    onRefreshMesh: () -> Unit,
+    onShareApk: () -> Unit
+) {
     val peers by manager.peers.collectAsState()
     val messages by manager.messages.collectAsState()
     val stats by manager.meshStats.collectAsState()
@@ -125,35 +159,52 @@ fun BitMeshScreen(manager: BleMeshManager, onShareApk: () -> Unit) {
             .fillMaxSize()
             .padding(12.dp)
     ) {
-        // Top Status Bar + Offline APK Share Button
-        Row(
+        // Top Status Card with weighted text column so buttons never get squished
+        Column(
             modifier = Modifier
                 .fillMaxWidth()
                 .background(Color(0xFF1F2937), RoundedCornerShape(10.dp))
-                .padding(12.dp),
-            horizontalArrangement = Arrangement.SpaceBetween,
-            verticalAlignment = Alignment.CenterVertically
+                .padding(12.dp)
         ) {
-            Column {
-                Text(
-                    text = "BITMESH // OFFLINE BLE E2EE",
-                    color = Color(0xFF10B981),
-                    fontFamily = FontFamily.Monospace,
-                    fontWeight = FontWeight.Bold,
-                    fontSize = 15.sp
-                )
-                Text(
-                    text = "$stats • Peers: ${peers.size}",
-                    color = Color(0xFF9CA3AF),
-                    fontFamily = FontFamily.Monospace,
-                    fontSize = 11.sp
-                )
-            }
-            Button(
-                onClick = onShareApk,
-                colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF2563EB))
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
             ) {
-                Text("Beam APK", fontSize = 12.sp)
+                Column(modifier = Modifier.weight(1f)) {
+                    Text(
+                        text = "BITMESH // OFFLINE BLE E2EE",
+                        color = Color(0xFF10B981),
+                        fontFamily = FontFamily.Monospace,
+                        fontWeight = FontWeight.Bold,
+                        fontSize = 14.sp
+                    )
+                    Spacer(modifier = Modifier.height(2.dp))
+                    Text(
+                        text = "$stats • Peers: ${peers.size}",
+                        color = Color(0xFFD1D5DB),
+                        fontFamily = FontFamily.Monospace,
+                        fontSize = 11.sp,
+                        maxLines = 2,
+                        overflow = TextOverflow.Ellipsis
+                    )
+                }
+                Spacer(modifier = Modifier.width(8.dp))
+                Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                    OutlinedButton(
+                        onClick = onRefreshMesh,
+                        contentPadding = PaddingValues(horizontal = 10.dp, vertical = 6.dp)
+                    ) {
+                        Text("Refresh", color = Color(0xFF34D399), fontSize = 11.sp)
+                    }
+                    Button(
+                        onClick = onShareApk,
+                        colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF2563EB)),
+                        contentPadding = PaddingValues(horizontal = 10.dp, vertical = 6.dp)
+                    ) {
+                        Text("Beam APK", color = Color.White, fontSize = 11.sp)
+                    }
+                }
             }
         }
 
@@ -167,14 +218,17 @@ fun BitMeshScreen(manager: BleMeshManager, onShareApk: () -> Unit) {
             FilterChip(
                 selected = selectedPeer == null,
                 onClick = { selectedPeer = null },
-                label = { Text("#general (Broadcast)") }
+                label = { Text("#general (Broadcast)", color = Color.White) }
             )
             peers.values.forEach { peer ->
                 FilterChip(
                     selected = selectedPeer?.nodeId == peer.nodeId,
                     onClick = { selectedPeer = peer },
                     label = {
-                        Text("🔒 ${peer.nickname} (${peer.hops} hop${if (peer.hops > 1) "s" else ""})")
+                        Text(
+                            "🔒 ${peer.nickname} (${peer.hops} hop${if (peer.hops > 1) "s" else ""})",
+                            color = Color.White
+                        )
                     }
                 )
             }
@@ -232,10 +286,18 @@ fun BitMeshScreen(manager: BleMeshManager, onShareApk: () -> Unit) {
                 value = inputText,
                 onValueChange = { inputText = it },
                 modifier = Modifier.weight(1f),
+                colors = OutlinedTextFieldDefaults.colors(
+                    focusedTextColor = Color.White,
+                    unfocusedTextColor = Color.White,
+                    cursorColor = Color(0xFF10B981),
+                    focusedBorderColor = Color(0xFF10B981),
+                    unfocusedBorderColor = Color(0xFF374151)
+                ),
                 placeholder = {
                     Text(
                         if (selectedPeer == null) "Encrypted message to #general..."
-                        else "ECDH + AES-256-GCM DM to ${selectedPeer!!.nickname}..."
+                        else "ECDH + AES-256-GCM DM to ${selectedPeer!!.nickname}...",
+                        color = Color(0xFF9CA3AF)
                     )
                 },
                 singleLine = true

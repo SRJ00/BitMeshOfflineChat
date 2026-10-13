@@ -4,17 +4,6 @@ import java.nio.ByteBuffer
 
 /**
  * Compact Binary Packet Format for BLE Mesh Multi-Hop Routing & Store-and-Forward.
- *
- * Header Layout (36 Bytes fixed header + variable payload):
- * - [0]      version: Byte       (0x01)
- * - [1]      packetType: Byte    (0x01 = KEY_ANNOUNCE, 0x02 = CHANNEL_MSG, 0x03 = DIRECT_E2EE_MSG, 0x04 = ACK)
- * - [2]      ttl: Byte           (Max 7 hops, decremented by each relay node)
- * - [3]      hopCount: Byte      (Incremented by each relay node so recipient sees hop distance)
- * - [4..11]  packetId: Long      (64-bit random ID for LRU deduplication so nodes never loop packets)
- * - [12..19] senderId: Long      (64-bit SHA-256 fingerprint of sender's public key)
- * - [20..27] recipientId: Long   (0L for broadcast/channel, or target node's 64-bit ID for Direct E2EE)
- * - [28..35] timestampSec: Long  (Epoch seconds for Store-and-Forward expiry)
- * - [36..N]  payload: ByteArray  (AES-256-GCM IV + Ciphertext + 128-bit Auth Tag, or X.509 PublicKey on announce)
  */
 data class MeshPacket(
     val version: Byte = 1,
@@ -79,10 +68,6 @@ data class MeshPacket(
         return buf.array()
     }
 
-    /**
-     * Associated Authenticated Data (AAD) bound into AES-256-GCM so relay nodes
-     * cannot alter senderId, recipientId, or packetId without failing GCM authentication.
-     */
     fun aeadHeaderBytes(): ByteArray {
         val buf = ByteBuffer.allocate(25)
         buf.put(packetType)
@@ -92,9 +77,6 @@ data class MeshPacket(
         return buf.array()
     }
 
-    /**
-     * Creates a forwarded copy with decremented TTL and incremented hopCount.
-     */
     fun nextHop(): MeshPacket? {
         if (ttl <= 1) return null
         return copy(
