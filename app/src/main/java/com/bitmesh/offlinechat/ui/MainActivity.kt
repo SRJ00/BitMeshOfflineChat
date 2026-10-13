@@ -114,14 +114,14 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun requestBlePermissions() {
-        val perms = mutableListOf(
-            Manifest.permission.ACCESS_FINE_LOCATION,
-            Manifest.permission.ACCESS_COARSE_LOCATION
-        )
+        val perms = mutableListOf<String>()
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
             perms.add(Manifest.permission.BLUETOOTH_SCAN)
             perms.add(Manifest.permission.BLUETOOTH_ADVERTISE)
             perms.add(Manifest.permission.BLUETOOTH_CONNECT)
+        } else {
+            perms.add(Manifest.permission.ACCESS_FINE_LOCATION)
+            perms.add(Manifest.permission.ACCESS_COARSE_LOCATION)
         }
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             perms.add(Manifest.permission.POST_NOTIFICATIONS)
@@ -159,7 +159,6 @@ fun BitMeshScreen(
             .fillMaxSize()
             .padding(12.dp)
     ) {
-        // Top Status Card with weighted text column so buttons never get squished
         Column(
             modifier = Modifier
                 .fillMaxWidth()
@@ -210,7 +209,6 @@ fun BitMeshScreen(
 
         Spacer(modifier = Modifier.height(8.dp))
 
-        // Nearby & Multi-Hop Peers Selector Strip
         Row(
             modifier = Modifier.fillMaxWidth(),
             horizontalArrangement = Arrangement.spacedBy(8.dp)
@@ -236,7 +234,6 @@ fun BitMeshScreen(
 
         Spacer(modifier = Modifier.height(8.dp))
 
-        // Encrypted Chat Feed
         LazyColumn(
             modifier = Modifier
                 .weight(1f)
@@ -247,8 +244,11 @@ fun BitMeshScreen(
         ) {
             items(messages) { msg ->
                 val badge = if (msg.isDirectEncrypted) "🔒 E2EE-DM" else msg.channel
-                val hopTag = if (msg.hops == 0) "local" else "${msg.hops}-hop relay"
-                val ackTag = if (msg.isDeliveredAck) " ✓✓ ACK" else ""
+                val deliveryStatus = if (msg.isOutgoing) {
+                    if (msg.isDeliveredAck) "You • Delivered ✓✓" else "You • Sent ⏳"
+                } else {
+                    "Received • ${msg.hops}-hop mesh"
+                }
                 Column(
                     modifier = Modifier
                         .fillMaxWidth()
@@ -259,7 +259,7 @@ fun BitMeshScreen(
                         .padding(8.dp)
                 ) {
                     Text(
-                        text = "[$badge] <${msg.senderName}> ($hopTag)$ackTag",
+                        text = "[$badge] <${msg.senderName}> ($deliveryStatus)",
                         color = Color(0xFF34D399),
                         fontFamily = FontFamily.Monospace,
                         fontSize = 11.sp,
@@ -277,7 +277,6 @@ fun BitMeshScreen(
 
         Spacer(modifier = Modifier.height(8.dp))
 
-        // Message Composer
         Row(
             modifier = Modifier.fillMaxWidth(),
             verticalAlignment = Alignment.CenterVertically

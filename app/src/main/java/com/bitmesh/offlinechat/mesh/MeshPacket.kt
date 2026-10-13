@@ -2,9 +2,6 @@ package com.bitmesh.offlinechat.mesh
 
 import java.nio.ByteBuffer
 
-/**
- * Compact Binary Packet Format for BLE Mesh Multi-Hop Routing & Store-and-Forward.
- */
 data class MeshPacket(
     val version: Byte = 1,
     val packetType: Byte,

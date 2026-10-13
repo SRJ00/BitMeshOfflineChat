@@ -13,17 +13,6 @@ import javax.crypto.spec.GCMParameterSpec
 import javax.crypto.spec.PBEKeySpec
 import javax.crypto.spec.SecretKeySpec
 
-/**
- * End-to-End Encryption Engine for BitMesh Offline Chat.
- *
- * Implements:
- * 1. Elliptic-Curve Diffie-Hellman (ECDH / secp256r1) Key Agreement
- * 2. HKDF-SHA256 Key Derivation with context binding
- * 3. AES-256-GCM Authenticated Encryption with Associated Data (AEAD)
- *    - 96-bit (12-byte) cryptographic random IV per packet
- *    - 128-bit (16-byte) authentication tag to block tampering by intermediate relay nodes
- * 4. PBKDF2-HMAC-SHA256 Channel Key Derivation for password-protected group channels (e.g. #general)
- */
 class CryptoEngine {
 
     companion object {

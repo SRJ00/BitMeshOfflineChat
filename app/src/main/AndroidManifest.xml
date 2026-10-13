@@ -5,13 +5,21 @@
     <!-- Required for BLE Mesh Networking -->
     <uses-feature android:name="android.hardware.bluetooth_le" android:required="true" />
 
-    <!-- Legacy Bluetooth Permissions (Valid on all API levels so BluetoothAdapter.isEnabled works reliably across OEM ROMs) -->
+    <!-- Base Bluetooth Permissions -->
     <uses-permission android:name="android.permission.BLUETOOTH" />
     <uses-permission android:name="android.permission.BLUETOOTH_ADMIN" />
-    <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
-    <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
 
-    <!-- Android 12+ (API 31+) Runtime Bluetooth Mesh Permissions -->
+    <!-- Location is ONLY required by Android OS on legacy Android 8-11 (API <= 30) for BLE scanning.
+         Setting maxSdkVersion="30" + neverForLocation on BLUETOOTH_SCAN guarantees ZERO location
+         permission prompts on Android 12, 13, 14, and 15+! -->
+    <uses-permission
+        android:name="android.permission.ACCESS_FINE_LOCATION"
+        android:maxSdkVersion="30" />
+    <uses-permission
+        android:name="android.permission.ACCESS_COARSE_LOCATION"
+        android:maxSdkVersion="30" />
+
+    <!-- Android 12+ (API 31+) Runtime Bluetooth Mesh Permissions ("Nearby Devices" only, no GPS/Location) -->
     <uses-permission
         android:name="android.permission.BLUETOOTH_SCAN"
         android:usesPermissionFlags="neverForLocation" />

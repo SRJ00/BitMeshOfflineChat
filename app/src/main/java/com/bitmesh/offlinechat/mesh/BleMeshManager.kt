@@ -17,6 +17,8 @@ import com.bitmesh.offlinechat.crypto.CryptoEngine
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import java.security.SecureRandom
 import java.util.*
 import java.util.concurrent.ConcurrentHashMap
@@ -45,14 +47,18 @@ data class ChatMessage(
 )
 
 /**
- * Dual-Role Android BLE Mesh Engine (GATT Server + GATT Client + Multi-Hop Relay + Store-and-Forward).
+ * Dual-Role Android BLE Mesh Engine (v1.3 — Symmetric Two-Way Delivery Fix).
  *
- * Fixes included in v1.1:
- * 1. Removed android:maxSdkVersion="30" from BLUETOOTH & BLUETOOTH_ADMIN in AndroidManifest.xml so
- *    BluetoothAdapter.isEnabled never throws a SecurityException or returns false on Android 12+ OEM ROMs.
- * 2. Listens to BluetoothAdapter.ACTION_STATE_CHANGED and runs a 3-second watchdog coroutine so
- *    the mesh starts automatically as soon as permissions are granted or Bluetooth is toggled on.
- * 3. Includes standard Client Characteristic Configuration Descriptor (0x2902) for reliable bidirectional GATT notifications.
+ * Key Fixes in v1.3:
+ * 1. Guaranteed Service Discovery on Second Phone: When two phones connect over the same ACL link,
+ *    the second phone's requestMtu(512) can return false because MTU is already negotiated.
+ *    v1.3 immediately falls back to discoverServices() if requestMtu() returns false or after 1200ms.
+ * 2. Serialized GATT Descriptor + Characteristic Writes: Waits for onDescriptorWrite() before sending
+ *    KEY_ANNOUNCE and paces GATT writes through a Mutex so Android's BluetoothGatt never drops packets.
+ * 3. Android 13/14/15 (API 33+) 3-arg & 4-arg GATT APIs: Uses the modern byte-array write/notify
+ *    overloads on API 33+ and overrides both 2-arg and 3-arg onCharacteristicChanged callbacks.
+ * 4. Symmetric Reverse Connect + Full Outbox Replay: caches both #general and E2EE-DM messages in
+ *    storeAndForwardOutbox and replays them the moment either phone connects.
  */
 @SuppressLint("MissingPermission")
 class BleMeshManager(
@@ -85,6 +91,7 @@ class BleMeshManager(
     private var isReceiverRegistered = false
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    private val gattWriteMutex = Mutex()
     private val secureRandom = SecureRandom()
 
     private val seenPacketIds = Collections.synchronizedSet(
@@ -102,8 +109,10 @@ class BleMeshManager(
         }
     )
 
+    // Outbox caches both #general and Direct E2EE messages so no message is lost before/between connections
     private val storeAndForwardOutbox = ConcurrentHashMap<Long, MeshPacket>()
     private val activeGattClients = ConcurrentHashMap<String, BluetoothGatt>()
+    private val readyGattClients = ConcurrentHashMap<String, BluetoothGatt>()
     private val connectedServerDevices = ConcurrentHashMap<String, BluetoothDevice>()
 
     private val _peers = MutableStateFlow<Map<Long, PeerNode>>(emptyMap())
@@ -132,13 +141,13 @@ class BleMeshManager(
 
     init {
         registerBluetoothStateReceiver()
-        // Watchdog loop: automatically recovers as soon as permissions are granted or Bluetooth turns on
         scope.launch {
             while (isActive) {
                 if (!isAdvertising || !isScanning || gattServer == null) {
                     ensureMeshRunning()
                 } else {
                     broadcastKeyAnnouncement()
+                    flushOutboxToPeers()
                 }
                 delay(4_000L)
             }
@@ -171,6 +180,8 @@ class BleMeshManager(
     fun startMesh() {
         scope.launch {
             ensureMeshRunning()
+            broadcastKeyAnnouncement()
+            flushOutboxToPeers()
         }
     }
 
@@ -202,7 +213,6 @@ class BleMeshManager(
         }
 
         _meshStats.value = "Online • ID ${cryptoEngine.shortFingerprintHex().take(6)}"
-        broadcastKeyAnnouncement()
     }
 
     fun stopMesh() {
@@ -216,6 +226,7 @@ class BleMeshManager(
         isScanning = false
         activeGattClients.values.forEach { runCatching { it.close() } }
         activeGattClients.clear()
+        readyGattClients.clear()
         runCatching { gattServer?.close() }
         gattServer = null
         scope.cancel()
@@ -268,10 +279,24 @@ class BleMeshManager(
 
         val settings = ScanSettings.Builder()
             .setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY)
+            .setCallbackType(ScanSettings.CALLBACK_TYPE_ALL_MATCHES)
+            .setMatchMode(ScanSettings.MATCH_MODE_AGGRESSIVE)
             .build()
 
         scanner?.startScan(listOf(filter), settings, scanCallback)
         isScanning = true
+    }
+
+    private fun connectToPeerDeviceIfNeeded(device: BluetoothDevice) {
+        val address = device.address ?: return
+        if (!activeGattClients.containsKey(address)) {
+            val gatt = runCatching {
+                device.connectGatt(context, false, gattClientCallback, BluetoothDevice.TRANSPORT_LE)
+            }.getOrNull()
+            if (gatt != null) {
+                activeGattClients[address] = gatt
+            }
+        }
     }
 
     fun broadcastKeyAnnouncement() {
@@ -294,6 +319,12 @@ class BleMeshManager(
         transmitPacketToAllPeers(packet)
     }
 
+    private fun flushOutboxToPeers() {
+        storeAndForwardOutbox.values.forEach { packet ->
+            transmitPacketToAllPeers(packet)
+        }
+    }
+
     fun sendChannelMessage(channel: String, text: String, channelPassword: String = "") {
         val packetId = secureRandom.nextLong()
         val tempPacket = MeshPacket(
@@ -309,6 +340,11 @@ class BleMeshManager(
 
         val finalPacket = tempPacket.copy(payload = encryptedPayload)
         seenPacketIds.add(packetId)
+
+        // Also cache #general messages in outbox so peers connecting a few seconds later still receive them!
+        if (storeAndForwardOutbox.size < MAX_OUTBOX_PACKETS) {
+            storeAndForwardOutbox[packetId] = finalPacket
+        }
 
         _messages.value = _messages.value + ChatMessage(
             packetId = packetId,
@@ -378,6 +414,7 @@ class BleMeshManager(
             }
             MeshPacket.TYPE_CHANNEL_MSG -> {
                 handleChannelMessage(packet)
+                sendDeliveryAck(packet.packetId, packet.senderId)
                 relayPacketIfTtlAllows(packet)
             }
             MeshPacket.TYPE_DIRECT_E2EE_MSG -> {
@@ -395,8 +432,8 @@ class BleMeshManager(
                 val ackedPacketId = if (packet.payload.size >= 8) {
                     java.nio.ByteBuffer.wrap(packet.payload).long
                 } else 0L
-                storeAndForwardOutbox.remove(ackedPacketId)
                 if (packet.recipientId == cryptoEngine.myNodeId) {
+                    storeAndForwardOutbox.remove(ackedPacketId)
                     _messages.value = _messages.value.map {
                         if (it.packetId == ackedPacketId) it.copy(isDeliveredAck = true) else it
                     }
@@ -414,6 +451,7 @@ class BleMeshManager(
             val pubKeyBytes = packet.payload.copyOfRange(1 + nickLen, packet.payload.size)
             val verifiedId = cryptoEngine.deriveNodeIdFromPublicKey(pubKeyBytes)
             if (verifiedId == packet.senderId && verifiedId != cryptoEngine.myNodeId) {
+                val isNewPeer = !_peers.value.containsKey(verifiedId)
                 val updated = _peers.value.toMutableMap()
                 updated[verifiedId] = PeerNode(
                     nodeId = verifiedId,
@@ -425,9 +463,10 @@ class BleMeshManager(
                 )
                 _peers.value = updated
 
-                storeAndForwardOutbox.values.forEach { queued ->
-                    transmitPacketToAllPeers(queued)
+                if (isNewPeer) {
+                    broadcastKeyAnnouncement()
                 }
+                flushOutboxToPeers()
             }
         }
     }
@@ -503,22 +542,49 @@ class BleMeshManager(
 
     private fun transmitPacketToAllPeers(packet: MeshPacket) {
         val raw = packet.toBytes()
-        activeGattClients.values.forEach { gatt ->
-            val service = gatt.getService(MESH_SERVICE_UUID)
-            val char = service?.getCharacteristic(PACKET_CHAR_UUID)
-            if (char != null) {
-                char.value = raw
-                char.writeType = BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE
-                runCatching { gatt.writeCharacteristic(char) }
-            }
-        }
-        val serverChar = gattServer
-            ?.getService(MESH_SERVICE_UUID)
-            ?.getCharacteristic(PACKET_CHAR_UUID)
-        if (serverChar != null) {
-            serverChar.value = raw
-            connectedServerDevices.values.forEach { device ->
-                runCatching { gattServer?.notifyCharacteristicChanged(device, serverChar, false) }
+        scope.launch {
+            gattWriteMutex.withLock {
+                // 1. Write as GATT Client to all discovered GATT Servers
+                readyGattClients.values.forEach { gatt ->
+                    val service = gatt.getService(MESH_SERVICE_UUID)
+                    val char = service?.getCharacteristic(PACKET_CHAR_UUID)
+                    if (char != null) {
+                        runCatching {
+                            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                                gatt.writeCharacteristic(
+                                    char,
+                                    raw,
+                                    BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
+                                )
+                            } else {
+                                @Suppress("DEPRECATION")
+                                char.value = raw
+                                char.writeType = BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
+                                @Suppress("DEPRECATION")
+                                gatt.writeCharacteristic(char)
+                            }
+                        }
+                    }
+                }
+                // 2. Notify as GATT Server to all connected GATT Clients
+                val serverChar = gattServer
+                    ?.getService(MESH_SERVICE_UUID)
+                    ?.getCharacteristic(PACKET_CHAR_UUID)
+                if (serverChar != null) {
+                    connectedServerDevices.values.forEach { device ->
+                        runCatching {
+                            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                                gattServer?.notifyCharacteristicChanged(device, serverChar, false, raw)
+                            } else {
+                                @Suppress("DEPRECATION")
+                                serverChar.value = raw
+                                @Suppress("DEPRECATION")
+                                gattServer?.notifyCharacteristicChanged(device, serverChar, false)
+                            }
+                        }
+                    }
+                }
+                delay(65L) // Pacing delay so consecutive GATT packets never collide
             }
         }
     }
@@ -538,13 +604,7 @@ class BleMeshManager(
     private val scanCallback = object : ScanCallback() {
         override fun onScanResult(callbackType: Int, result: ScanResult) {
             val device = result.device ?: return
-            val address = device.address ?: return
-            if (!activeGattClients.containsKey(address)) {
-                val gatt = device.connectGatt(context, false, gattClientCallback, BluetoothDevice.TRANSPORT_LE)
-                if (gatt != null) {
-                    activeGattClients[address] = gatt
-                }
-            }
+            connectToPeerDeviceIfNeeded(device)
         }
 
         override fun onScanFailed(errorCode: Int) {
@@ -555,11 +615,24 @@ class BleMeshManager(
 
     private val gattClientCallback = object : BluetoothGattCallback() {
         override fun onConnectionStateChange(gatt: BluetoothGatt, status: Int, newState: Int) {
+            val address = gatt.device.address
             if (newState == BluetoothProfile.STATE_CONNECTED) {
-                gatt.requestMtu(512)
+                // Request 512 MTU, AND set a fallback timer in case MTU was already exchanged on the shared ACL link!
+                val requested = runCatching { gatt.requestMtu(512) }.getOrDefault(false)
+                if (!requested) {
+                    gatt.discoverServices()
+                } else {
+                    scope.launch {
+                        delay(1200L)
+                        if (!readyGattClients.containsKey(address)) {
+                            runCatching { gatt.discoverServices() }
+                        }
+                    }
+                }
             } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
-                activeGattClients.remove(gatt.device.address)
-                gatt.close()
+                activeGattClients.remove(address)
+                readyGattClients.remove(address)
+                runCatching { gatt.close() }
             }
         }
 
@@ -571,22 +644,68 @@ class BleMeshManager(
             if (status == BluetoothGatt.GATT_SUCCESS) {
                 val char = gatt.getService(MESH_SERVICE_UUID)?.getCharacteristic(PACKET_CHAR_UUID)
                 if (char != null) {
+                    readyGattClients[gatt.device.address] = gatt
                     gatt.setCharacteristicNotification(char, true)
                     val descriptor = char.getDescriptor(CCCD_UUID)
                     if (descriptor != null) {
-                        descriptor.value = BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
-                        runCatching { gatt.writeDescriptor(descriptor) }
+                        runCatching {
+                            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                                gatt.writeDescriptor(
+                                    descriptor,
+                                    BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
+                                )
+                            } else {
+                                @Suppress("DEPRECATION")
+                                descriptor.value = BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
+                                @Suppress("DEPRECATION")
+                                gatt.writeDescriptor(descriptor)
+                            }
+                        }
+                        // Fallback in case onDescriptorWrite doesn't fire on custom ROM
+                        scope.launch {
+                            delay(450L)
+                            broadcastKeyAnnouncement()
+                            flushOutboxToPeers()
+                        }
+                    } else {
+                        broadcastKeyAnnouncement()
+                        flushOutboxToPeers()
                     }
-                    broadcastKeyAnnouncement()
                 }
             }
         }
 
+        override fun onDescriptorWrite(
+            gatt: BluetoothGatt,
+            descriptor: BluetoothGattDescriptor,
+            status: Int
+        ) {
+            // Descriptor write finished — now it is safe to send KEY_ANNOUNCE and flush queued messages!
+            broadcastKeyAnnouncement()
+            flushOutboxToPeers()
+        }
+
+        // Android 13+ (API 33+) 3-parameter callback
+        override fun onCharacteristicChanged(
+            gatt: BluetoothGatt,
+            characteristic: BluetoothGattCharacteristic,
+            value: ByteArray
+        ) {
+            if (characteristic.uuid == PACKET_CHAR_UUID) {
+                onPacketReceived(value, -60)
+            }
+        }
+
+        // Legacy Android 8-12 2-parameter callback
+        @Deprecated("Deprecated in API 33")
         override fun onCharacteristicChanged(
             gatt: BluetoothGatt,
             characteristic: BluetoothGattCharacteristic
         ) {
-            if (characteristic.uuid == PACKET_CHAR_UUID) {
+            if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU &&
+                characteristic.uuid == PACKET_CHAR_UUID
+            ) {
+                @Suppress("DEPRECATION")
                 onPacketReceived(characteristic.value ?: return, -60)
             }
         }
@@ -596,7 +715,13 @@ class BleMeshManager(
         override fun onConnectionStateChange(device: BluetoothDevice, status: Int, newState: Int) {
             if (newState == BluetoothProfile.STATE_CONNECTED) {
                 connectedServerDevices[device.address] = device
-                broadcastKeyAnnouncement()
+                // Immediately establish reverse GATT client link so both phones have symmetric two-way channels
+                connectToPeerDeviceIfNeeded(device)
+                scope.launch {
+                    delay(300L)
+                    broadcastKeyAnnouncement()
+                    flushOutboxToPeers()
+                }
             } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
                 connectedServerDevices.remove(device.address)
             }
@@ -613,6 +738,12 @@ class BleMeshManager(
         ) {
             if (responseNeeded) {
                 gattServer?.sendResponse(device, requestId, BluetoothGatt.GATT_SUCCESS, 0, null)
+            }
+            // Client just subscribed to our notifications — send our key and any queued messages!
+            scope.launch {
+                delay(150L)
+                broadcastKeyAnnouncement()
+                flushOutboxToPeers()
             }
         }
 
