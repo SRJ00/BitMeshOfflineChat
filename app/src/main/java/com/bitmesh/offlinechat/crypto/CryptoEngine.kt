@@ -1,9 +1,11 @@
 package com.bitmesh.offlinechat.crypto
 
+import android.content.Context
 import android.util.Base64
 import java.nio.ByteBuffer
 import java.security.*
 import java.security.spec.ECGenParameterSpec
+import java.security.spec.PKCS8EncodedKeySpec
 import java.security.spec.X509EncodedKeySpec
 import javax.crypto.Cipher
 import javax.crypto.KeyAgreement
@@ -13,9 +15,16 @@ import javax.crypto.spec.GCMParameterSpec
 import javax.crypto.spec.PBEKeySpec
 import javax.crypto.spec.SecretKeySpec
 
-class CryptoEngine {
+/**
+ * End-to-End Encryption Engine for BitMesh Offline Chat (v1.4).
+ * Persists the device's EC keypair in SharedPreferences so your Node ID stays consistent across app restarts.
+ */
+class CryptoEngine(context: Context? = null) {
 
     companion object {
+        private const val PREFS_NAME = "bitmesh_crypto_prefs"
+        private const val KEY_PUB = "identity_pub_b64"
+        private const val KEY_PRIV = "identity_priv_b64"
         private const val AES_GCM_TRANSFORMATION = "AES/GCM/NoPadding"
         private const val GCM_IV_LENGTH_BYTES = 12
         private const val GCM_TAG_LENGTH_BITS = 128
@@ -23,7 +32,7 @@ class CryptoEngine {
     }
 
     private val secureRandom = SecureRandom()
-    val identityKeyPair: KeyPair = generateIdentityKeyPair()
+    val identityKeyPair: KeyPair = loadOrGenerateIdentityKeyPair(context)
 
     val myNodeId: Long by lazy {
         deriveNodeIdFromPublicKey(identityKeyPair.public.encoded)
@@ -32,10 +41,32 @@ class CryptoEngine {
     val myPublicKeyBytes: ByteArray
         get() = identityKeyPair.public.encoded
 
-    private fun generateIdentityKeyPair(): KeyPair {
+    private fun loadOrGenerateIdentityKeyPair(context: Context?): KeyPair {
+        if (context != null) {
+            runCatching {
+                val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+                val pubB64 = prefs.getString(KEY_PUB, null)
+                val privB64 = prefs.getString(KEY_PRIV, null)
+                if (pubB64 != null && privB64 != null) {
+                    val kf = KeyFactory.getInstance("EC")
+                    val pub = kf.generatePublic(X509EncodedKeySpec(Base64.decode(pubB64, Base64.NO_WRAP)))
+                    val priv = kf.generatePrivate(PKCS8EncodedKeySpec(Base64.decode(privB64, Base64.NO_WRAP)))
+                    return KeyPair(pub, priv)
+                }
+            }
+        }
         val kpg = KeyPairGenerator.getInstance("EC")
         kpg.initialize(ECGenParameterSpec("secp256r1"), secureRandom)
-        return kpg.generateKeyPair()
+        val kp = kpg.generateKeyPair()
+        if (context != null) {
+            runCatching {
+                context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE).edit()
+                    .putString(KEY_PUB, Base64.encodeToString(kp.public.encoded, Base64.NO_WRAP))
+                    .putString(KEY_PRIV, Base64.encodeToString(kp.private.encoded, Base64.NO_WRAP))
+                    .apply()
+            }
+        }
+        return kp
     }
 
     fun deriveNodeIdFromPublicKey(pubKeyEncoded: ByteArray): Long {
@@ -115,7 +146,4 @@ class CryptoEngine {
         mac.init(SecretKeySpec(key, "HmacSHA256"))
         return mac.doFinal(data)
     }
-
-    fun exportPublicKeyBase64(): String =
-        Base64.encodeToString(myPublicKeyBytes, Base64.NO_WRAP)
 }

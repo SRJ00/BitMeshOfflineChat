@@ -2,6 +2,10 @@ package com.bitmesh.offlinechat.mesh
 
 import android.Manifest
 import android.annotation.SuppressLint
+import android.app.Notification
+import android.app.NotificationChannel
+import android.app.NotificationManager
+import android.app.PendingIntent
 import android.bluetooth.*
 import android.bluetooth.le.*
 import android.content.BroadcastReceiver
@@ -14,6 +18,7 @@ import android.os.ParcelUuid
 import android.util.Log
 import androidx.core.content.ContextCompat
 import com.bitmesh.offlinechat.crypto.CryptoEngine
+import com.bitmesh.offlinechat.ui.MainActivity
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -47,33 +52,48 @@ data class ChatMessage(
 )
 
 /**
- * Dual-Role Android BLE Mesh Engine (v1.3 — Symmetric Two-Way Delivery Fix).
+ * Dual-Role Android BLE Mesh Engine (v1.4).
  *
- * Key Fixes in v1.3:
- * 1. Guaranteed Service Discovery on Second Phone: When two phones connect over the same ACL link,
- *    the second phone's requestMtu(512) can return false because MTU is already negotiated.
- *    v1.3 immediately falls back to discoverServices() if requestMtu() returns false or after 1200ms.
- * 2. Serialized GATT Descriptor + Characteristic Writes: Waits for onDescriptorWrite() before sending
- *    KEY_ANNOUNCE and paces GATT writes through a Mutex so Android's BluetoothGatt never drops packets.
- * 3. Android 13/14/15 (API 33+) 3-arg & 4-arg GATT APIs: Uses the modern byte-array write/notify
- *    overloads on API 33+ and overrides both 2-arg and 3-arg onCharacteristicChanged callbacks.
- * 4. Symmetric Reverse Connect + Full Outbox Replay: caches both #general and E2EE-DM messages in
- *    storeAndForwardOutbox and replays them the moment either phone connects.
+ * New in v1.4:
+ * 1. Generalized 64-Hop Long-Distance Relaying (1 km to 5+ km across chains of nodes):
+ *    - MAX_TTL = 64 on all packets (KEY_ANNOUNCE, CHANNEL_MSG, DIRECT_E2EE_MSG, DELIVERY_ACK).
+ *    - Intermediate nodes cache & forward peer KEY_ANNOUNCE packets (peerAnnouncementCache) AND
+ *      unacknowledged messages (storeAndForwardOutbox) so distant nodes 1 km+ apart discover each
+ *      other's public keys, custom names, and messages across any number of intermediate hops up to 64.
+ *    - Self-contained E2EE Direct Message envelope embeds the sender's public key so even if a DM arrives
+ *      before KEY_ANNOUNCE over a multi-hop path, the recipient can always verify & decrypt it.
+ * 2. Custom Personal Name Configuration:
+ *    - Persists the user's custom name in SharedPreferences and immediately broadcasts it across the mesh.
+ * 3. High-Priority Heads-Up Push Notifications:
+ *    - Posts a banner notification with sound & vibration on the IMPORTANCE_HIGH channel whenever a
+ *      new #general or Direct Message arrives.
  */
 @SuppressLint("MissingPermission")
 class BleMeshManager(
     private val context: Context,
-    val cryptoEngine: CryptoEngine,
-    var myNickname: String = "Node-${cryptoEngine.shortFingerprintHex().take(4)}"
+    val cryptoEngine: CryptoEngine
 ) {
     companion object {
         private const val TAG = "BleMeshManager"
+        private const val PREFS_NAME = "bitmesh_user_prefs"
+        private const val KEY_NICKNAME = "custom_nickname"
+        private const val MSG_NOTIFICATION_CHANNEL_ID = "bitmesh_incoming_messages"
+
         val MESH_SERVICE_UUID: UUID = UUID.fromString("b17c4a70-0001-4000-8000-00805f9b34fb")
         val PACKET_CHAR_UUID: UUID = UUID.fromString("b17c4a70-0002-4000-8000-00805f9b34fb")
         val CCCD_UUID: UUID = UUID.fromString("00002902-0000-1000-8000-00805f9b34fb")
-        private const val MAX_SEEN_PACKETS = 2048
-        private const val MAX_OUTBOX_PACKETS = 256
+        private const val MAX_SEEN_PACKETS = 8192
+        private const val MAX_OUTBOX_PACKETS = 512
     }
+
+    private val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+    private val notificationManager = context.getSystemService(NotificationManager::class.java)
+
+    private val _myNicknameFlow = MutableStateFlow(loadSavedNickname())
+    val myNicknameFlow: StateFlow<String> = _myNicknameFlow
+
+    val myNickname: String
+        get() = _myNicknameFlow.value
 
     private val bluetoothManager = context.getSystemService(Context.BLUETOOTH_SERVICE) as BluetoothManager
     private val bluetoothAdapter: BluetoothAdapter?
@@ -109,7 +129,8 @@ class BleMeshManager(
         }
     )
 
-    // Outbox caches both #general and Direct E2EE messages so no message is lost before/between connections
+    // Caches latest KEY_ANNOUNCE packet per distant node so intermediate nodes propagate the mesh directory across 1km+
+    private val peerAnnouncementCache = ConcurrentHashMap<Long, MeshPacket>()
     private val storeAndForwardOutbox = ConcurrentHashMap<Long, MeshPacket>()
     private val activeGattClients = ConcurrentHashMap<String, BluetoothGatt>()
     private val readyGattClients = ConcurrentHashMap<String, BluetoothGatt>()
@@ -140,6 +161,7 @@ class BleMeshManager(
     }
 
     init {
+        createIncomingMessageNotificationChannel()
         registerBluetoothStateReceiver()
         scope.launch {
             while (isActive) {
@@ -151,6 +173,74 @@ class BleMeshManager(
                 }
                 delay(4_000L)
             }
+        }
+    }
+
+    private fun loadSavedNickname(): String {
+        val defaultName = "Node-${cryptoEngine.shortFingerprintHex().take(4)}"
+        return prefs.getString(KEY_NICKNAME, null)?.takeIf { it.isNotBlank() } ?: defaultName
+    }
+
+    /**
+     * Updates the user's personal display name, saves it persistently, and broadcasts it across all mesh hops.
+     */
+    fun updateNickname(newName: String) {
+        val cleaned = newName.trim().replace("|", "").take(24)
+        if (cleaned.isEmpty()) return
+        prefs.edit().putString(KEY_NICKNAME, cleaned).apply()
+        _myNicknameFlow.value = cleaned
+        _meshStats.value = "Online as $cleaned"
+        broadcastKeyAnnouncement()
+    }
+
+    private fun createIncomingMessageNotificationChannel() {
+        val channel = NotificationChannel(
+            MSG_NOTIFICATION_CHANNEL_ID,
+            "Incoming Mesh Messages",
+            NotificationManager.IMPORTANCE_HIGH
+        ).apply {
+            description = "Alerts when a new offline Bluetooth mesh message arrives"
+            enableVibration(true)
+            enableLights(true)
+        }
+        notificationManager.createNotificationChannel(channel)
+    }
+
+    private fun postIncomingMessageNotification(
+        senderName: String,
+        messageText: String,
+        isDirect: Boolean,
+        hops: Int
+    ) {
+        runCatching {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+                ContextCompat.checkSelfPermission(context, Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
+            ) {
+                return
+            }
+            val tapIntent = Intent(context, MainActivity::class.java).apply {
+                flags = Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP
+            }
+            val pendingIntent = PendingIntent.getActivity(
+                context,
+                0,
+                tapIntent,
+                PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+            )
+            val title = if (isDirect) {
+                "🔒 Private message from $senderName ($hops hop${if (hops > 1) "s" else ""})"
+            } else {
+                "#general • $senderName ($hops hop${if (hops > 1) "s" else ""})"
+            }
+            val notification = Notification.Builder(context, MSG_NOTIFICATION_CHANNEL_ID)
+                .setSmallIcon(android.R.drawable.stat_notify_chat)
+                .setContentTitle(title)
+                .setContentText(messageText)
+                .setContentIntent(pendingIntent)
+                .setAutoCancel(true)
+                .build()
+
+            notificationManager.notify((System.currentTimeMillis() and 0xFFFFFFF).toInt(), notification)
         }
     }
 
@@ -212,7 +302,7 @@ class BleMeshManager(
             runCatching { startScanning() }
         }
 
-        _meshStats.value = "Online • ID ${cryptoEngine.shortFingerprintHex().take(6)}"
+        _meshStats.value = "Online as $myNickname"
     }
 
     fun stopMesh() {
@@ -299,6 +389,10 @@ class BleMeshManager(
         }
     }
 
+    /**
+     * Broadcasts our public key + custom nickname with MAX_TTL = 64 hops so nodes 1km+ away
+     * across a multi-hop chain discover our name and public key.
+     */
     fun broadcastKeyAnnouncement() {
         val nickBytes = myNickname.toByteArray(Charsets.UTF_8)
         val pubKey = cryptoEngine.myPublicKeyBytes
@@ -309,7 +403,7 @@ class BleMeshManager(
 
         val packet = MeshPacket(
             packetType = MeshPacket.TYPE_KEY_ANNOUNCE,
-            ttl = 3,
+            ttl = MeshPacket.MAX_TTL,
             packetId = secureRandom.nextLong(),
             senderId = cryptoEngine.myNodeId,
             recipientId = MeshPacket.BROADCAST_RECIPIENT,
@@ -320,6 +414,11 @@ class BleMeshManager(
     }
 
     private fun flushOutboxToPeers() {
+        // Propagate known multi-hop peer announcements first so distant nodes learn public keys
+        peerAnnouncementCache.values.forEach { announcePacket ->
+            announcePacket.nextHop()?.let { transmitPacketToAllPeers(it) }
+        }
+        // Then replay any cached messages
         storeAndForwardOutbox.values.forEach { packet ->
             transmitPacketToAllPeers(packet)
         }
@@ -329,6 +428,7 @@ class BleMeshManager(
         val packetId = secureRandom.nextLong()
         val tempPacket = MeshPacket(
             packetType = MeshPacket.TYPE_CHANNEL_MSG,
+            ttl = MeshPacket.MAX_TTL,
             packetId = packetId,
             senderId = cryptoEngine.myNodeId,
             recipientId = MeshPacket.BROADCAST_RECIPIENT,
@@ -341,7 +441,6 @@ class BleMeshManager(
         val finalPacket = tempPacket.copy(payload = encryptedPayload)
         seenPacketIds.add(packetId)
 
-        // Also cache #general messages in outbox so peers connecting a few seconds later still receive them!
         if (storeAndForwardOutbox.size < MAX_OUTBOX_PACKETS) {
             storeAndForwardOutbox[packetId] = finalPacket
         }
@@ -361,6 +460,11 @@ class BleMeshManager(
         transmitPacketToAllPeers(finalPacket)
     }
 
+    /**
+     * Sends an End-to-End Encrypted Direct Message with MAX_TTL = 64 hops.
+     * Embeds the sender's public key in the outer envelope ([1-byte pubKeyLen][senderPubKey][AES-GCM])
+     * so even a recipient 1km+ away who receives the DM before KEY_ANNOUNCE can immediately decrypt it!
+     */
     fun sendDirectEncryptedMessage(recipientId: Long, text: String) {
         val peer = _peers.value[recipientId] ?: return
         val sharedKey = cryptoEngine.deriveSharedAeadKey(peer.publicKeyBytes)
@@ -368,18 +472,25 @@ class BleMeshManager(
 
         val tempPacket = MeshPacket(
             packetType = MeshPacket.TYPE_DIRECT_E2EE_MSG,
+            ttl = MeshPacket.MAX_TTL,
             packetId = packetId,
             senderId = cryptoEngine.myNodeId,
             recipientId = recipientId,
             payload = ByteArray(0)
         )
         val plaintext = "$myNickname|$text".toByteArray(Charsets.UTF_8)
-        val encryptedPayload = cryptoEngine.encryptAead(
+        val ciphertext = cryptoEngine.encryptAead(
             plaintext,
             sharedKey,
             tempPacket.aeadHeaderBytes()
         )
-        val finalPacket = tempPacket.copy(payload = encryptedPayload)
+        val myPub = cryptoEngine.myPublicKeyBytes
+        val fullPayload = ByteArray(1 + myPub.size + ciphertext.size)
+        fullPayload[0] = myPub.size.toByte()
+        System.arraycopy(myPub, 0, fullPayload, 1, myPub.size)
+        System.arraycopy(ciphertext, 0, fullPayload, 1 + myPub.size, ciphertext.size)
+
+        val finalPacket = tempPacket.copy(payload = fullPayload)
 
         seenPacketIds.add(packetId)
         if (storeAndForwardOutbox.size < MAX_OUTBOX_PACKETS) {
@@ -404,26 +515,33 @@ class BleMeshManager(
     private fun onPacketReceived(rawBytes: ByteArray, rssi: Int) {
         val packet = MeshPacket.fromBytes(rawBytes) ?: return
         if (!seenPacketIds.add(packet.packetId)) {
-            return
+            return // Already seen/relayed this packetId — prevents broadcast loops
         }
 
         when (packet.packetType) {
             MeshPacket.TYPE_KEY_ANNOUNCE -> {
                 handleKeyAnnouncement(packet, rssi)
+                // Relay announcement across up to 64 hops so nodes 1km+ away discover this peer
                 relayPacketIfTtlAllows(packet)
             }
             MeshPacket.TYPE_CHANNEL_MSG -> {
                 handleChannelMessage(packet)
                 sendDeliveryAck(packet.packetId, packet.senderId)
+                // Cache & relay across up to 64 hops
+                if (storeAndForwardOutbox.size < MAX_OUTBOX_PACKETS) {
+                    packet.nextHop()?.let { storeAndForwardOutbox[packet.packetId] = it }
+                }
                 relayPacketIfTtlAllows(packet)
             }
             MeshPacket.TYPE_DIRECT_E2EE_MSG -> {
                 if (packet.recipientId == cryptoEngine.myNodeId) {
+                    // Addressed to us! Decrypt and send multi-hop ACK back to sender
                     handleDirectMessageForMe(packet)
                     sendDeliveryAck(packet.packetId, packet.senderId)
                 } else {
+                    // Addressed to someone further away (e.g. 1km away): cache & jump to next hop!
                     if (storeAndForwardOutbox.size < MAX_OUTBOX_PACKETS) {
-                        storeAndForwardOutbox[packet.packetId] = packet
+                        packet.nextHop()?.let { storeAndForwardOutbox[packet.packetId] = it }
                     }
                     relayPacketIfTtlAllows(packet)
                 }
@@ -432,12 +550,13 @@ class BleMeshManager(
                 val ackedPacketId = if (packet.payload.size >= 8) {
                     java.nio.ByteBuffer.wrap(packet.payload).long
                 } else 0L
+                storeAndForwardOutbox.remove(ackedPacketId)
                 if (packet.recipientId == cryptoEngine.myNodeId) {
-                    storeAndForwardOutbox.remove(ackedPacketId)
                     _messages.value = _messages.value.map {
                         if (it.packetId == ackedPacketId) it.copy(isDeliveredAck = true) else it
                     }
                 } else {
+                    // Relay the ACK back across the multi-hop chain to the original sender!
                     relayPacketIfTtlAllows(packet)
                 }
             }
@@ -451,22 +570,24 @@ class BleMeshManager(
             val pubKeyBytes = packet.payload.copyOfRange(1 + nickLen, packet.payload.size)
             val verifiedId = cryptoEngine.deriveNodeIdFromPublicKey(pubKeyBytes)
             if (verifiedId == packet.senderId && verifiedId != cryptoEngine.myNodeId) {
-                val isNewPeer = !_peers.value.containsKey(verifiedId)
+                val existing = _peers.value[verifiedId]
                 val updated = _peers.value.toMutableMap()
+                val hops = packet.hopCount.toInt() + 1
                 updated[verifiedId] = PeerNode(
                     nodeId = verifiedId,
                     nickname = nickname,
                     publicKeyBytes = pubKeyBytes,
                     rssi = rssi,
-                    hops = packet.hopCount.toInt() + 1,
+                    hops = if (existing != null) minOf(existing.hops, hops) else hops,
                     lastSeenMs = System.currentTimeMillis()
                 )
                 _peers.value = updated
+                peerAnnouncementCache[verifiedId] = packet
 
-                if (isNewPeer) {
+                if (existing == null) {
                     broadcastKeyAnnouncement()
+                    flushOutboxToPeers()
                 }
-                flushOutboxToPeers()
             }
         }
     }
@@ -480,33 +601,60 @@ class BleMeshManager(
             )
             val parts = decrypted.split("|", limit = 3)
             if (parts.size == 3) {
+                val senderName = parts[1]
+                val text = parts[2]
+                val hops = packet.hopCount.toInt() + 1
                 _messages.value = _messages.value + ChatMessage(
                     packetId = packet.packetId,
                     senderId = packet.senderId,
-                    senderName = parts[1],
+                    senderName = senderName,
                     recipientId = MeshPacket.BROADCAST_RECIPIENT,
                     channel = parts[0],
-                    text = parts[2],
-                    hops = packet.hopCount.toInt() + 1,
+                    text = text,
+                    hops = hops,
                     timestampSec = packet.timestampSec,
                     isDirectEncrypted = false,
                     isOutgoing = false
                 )
+                postIncomingMessageNotification(senderName, text, isDirect = false, hops = hops)
             }
         }
     }
 
     private fun handleDirectMessageForMe(packet: MeshPacket) {
-        val senderPeer = _peers.value[packet.senderId] ?: return
         runCatching {
-            val sharedKey = cryptoEngine.deriveSharedAeadKey(senderPeer.publicKeyBytes)
+            val pubKeyLen = packet.payload[0].toInt() and 0xFF
+            val senderPubKey = packet.payload.copyOfRange(1, 1 + pubKeyLen)
+            val ciphertext = packet.payload.copyOfRange(1 + pubKeyLen, packet.payload.size)
+
+            // Verify that senderPubKey matches packet.senderId
+            val verifiedSenderId = cryptoEngine.deriveNodeIdFromPublicKey(senderPubKey)
+            if (verifiedSenderId != packet.senderId) return
+
+            val sharedKey = cryptoEngine.deriveSharedAeadKey(senderPubKey)
             val decrypted = String(
-                cryptoEngine.decryptAead(packet.payload, sharedKey, packet.aeadHeaderBytes()),
+                cryptoEngine.decryptAead(ciphertext, sharedKey, packet.aeadHeaderBytes()),
                 Charsets.UTF_8
             )
             val parts = decrypted.split("|", limit = 2)
-            val senderName = if (parts.size == 2) parts[0] else senderPeer.nickname
+            val senderName = if (parts.size == 2) parts[0] else "Peer"
             val text = if (parts.size == 2) parts[1] else decrypted
+            val hops = packet.hopCount.toInt() + 1
+
+            // Auto-register sender in peers map if not already present (e.g. across multi-hop chain)
+            if (!_peers.value.containsKey(verifiedSenderId)) {
+                val updated = _peers.value.toMutableMap()
+                updated[verifiedSenderId] = PeerNode(
+                    nodeId = verifiedSenderId,
+                    nickname = senderName,
+                    publicKeyBytes = senderPubKey,
+                    rssi = -70,
+                    hops = hops,
+                    lastSeenMs = System.currentTimeMillis()
+                )
+                _peers.value = updated
+            }
+
             _messages.value = _messages.value + ChatMessage(
                 packetId = packet.packetId,
                 senderId = packet.senderId,
@@ -514,11 +662,12 @@ class BleMeshManager(
                 recipientId = cryptoEngine.myNodeId,
                 channel = "DM:$senderName",
                 text = text,
-                hops = packet.hopCount.toInt() + 1,
+                hops = hops,
                 timestampSec = packet.timestampSec,
                 isDirectEncrypted = true,
                 isOutgoing = false
             )
+            postIncomingMessageNotification(senderName, text, isDirect = true, hops = hops)
         }
     }
 
@@ -526,6 +675,7 @@ class BleMeshManager(
         val ackPayload = java.nio.ByteBuffer.allocate(8).putLong(originalPacketId).array()
         val ackPacket = MeshPacket(
             packetType = MeshPacket.TYPE_DELIVERY_ACK,
+            ttl = MeshPacket.MAX_TTL,
             packetId = secureRandom.nextLong(),
             senderId = cryptoEngine.myNodeId,
             recipientId = originalSenderId,
@@ -544,7 +694,6 @@ class BleMeshManager(
         val raw = packet.toBytes()
         scope.launch {
             gattWriteMutex.withLock {
-                // 1. Write as GATT Client to all discovered GATT Servers
                 readyGattClients.values.forEach { gatt ->
                     val service = gatt.getService(MESH_SERVICE_UUID)
                     val char = service?.getCharacteristic(PACKET_CHAR_UUID)
@@ -566,7 +715,6 @@ class BleMeshManager(
                         }
                     }
                 }
-                // 2. Notify as GATT Server to all connected GATT Clients
                 val serverChar = gattServer
                     ?.getService(MESH_SERVICE_UUID)
                     ?.getCharacteristic(PACKET_CHAR_UUID)
@@ -584,7 +732,7 @@ class BleMeshManager(
                         }
                     }
                 }
-                delay(65L) // Pacing delay so consecutive GATT packets never collide
+                delay(65L)
             }
         }
     }
@@ -592,7 +740,7 @@ class BleMeshManager(
     private val advertiseCallback = object : AdvertiseCallback() {
         override fun onStartSuccess(settingsInEffect: AdvertiseSettings?) {
             isAdvertising = true
-            _meshStats.value = "Online • ID ${cryptoEngine.shortFingerprintHex().take(6)}"
+            _meshStats.value = "Online as $myNickname"
             Log.d(TAG, "BLE Mesh Advertising active")
         }
         override fun onStartFailure(errorCode: Int) {
@@ -617,7 +765,6 @@ class BleMeshManager(
         override fun onConnectionStateChange(gatt: BluetoothGatt, status: Int, newState: Int) {
             val address = gatt.device.address
             if (newState == BluetoothProfile.STATE_CONNECTED) {
-                // Request 512 MTU, AND set a fallback timer in case MTU was already exchanged on the shared ACL link!
                 val requested = runCatching { gatt.requestMtu(512) }.getOrDefault(false)
                 if (!requested) {
                     gatt.discoverServices()
@@ -661,7 +808,6 @@ class BleMeshManager(
                                 gatt.writeDescriptor(descriptor)
                             }
                         }
-                        // Fallback in case onDescriptorWrite doesn't fire on custom ROM
                         scope.launch {
                             delay(450L)
                             broadcastKeyAnnouncement()
@@ -680,12 +826,10 @@ class BleMeshManager(
             descriptor: BluetoothGattDescriptor,
             status: Int
         ) {
-            // Descriptor write finished — now it is safe to send KEY_ANNOUNCE and flush queued messages!
             broadcastKeyAnnouncement()
             flushOutboxToPeers()
         }
 
-        // Android 13+ (API 33+) 3-parameter callback
         override fun onCharacteristicChanged(
             gatt: BluetoothGatt,
             characteristic: BluetoothGattCharacteristic,
@@ -696,7 +840,6 @@ class BleMeshManager(
             }
         }
 
-        // Legacy Android 8-12 2-parameter callback
         @Deprecated("Deprecated in API 33")
         override fun onCharacteristicChanged(
             gatt: BluetoothGatt,
@@ -715,7 +858,6 @@ class BleMeshManager(
         override fun onConnectionStateChange(device: BluetoothDevice, status: Int, newState: Int) {
             if (newState == BluetoothProfile.STATE_CONNECTED) {
                 connectedServerDevices[device.address] = device
-                // Immediately establish reverse GATT client link so both phones have symmetric two-way channels
                 connectToPeerDeviceIfNeeded(device)
                 scope.launch {
                     delay(300L)
@@ -739,7 +881,6 @@ class BleMeshManager(
             if (responseNeeded) {
                 gattServer?.sendResponse(device, requestId, BluetoothGatt.GATT_SUCCESS, 0, null)
             }
-            // Client just subscribed to our notifications — send our key and any queued messages!
             scope.launch {
                 delay(150L)
                 broadcastKeyAnnouncement()

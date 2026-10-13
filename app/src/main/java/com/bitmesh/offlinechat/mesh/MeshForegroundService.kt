@@ -25,7 +25,7 @@ class MeshForegroundService : Service() {
         val channelId = "bitmesh_service_channel"
         val channel = NotificationChannel(
             channelId,
-            "BitMesh Offline BLE Relay",
+            "BitMesh Background Relay",
             NotificationManager.IMPORTANCE_LOW
         )
         val nm = getSystemService(NotificationManager::class.java)
@@ -33,13 +33,13 @@ class MeshForegroundService : Service() {
 
         val notification = Notification.Builder(this, channelId)
             .setContentTitle("BitMesh Offline Mesh Active")
-            .setContentText("Relaying E2EE Bluetooth mesh packets (no internet required)")
+            .setContentText("Relaying encrypted multi-hop Bluetooth packets")
             .setSmallIcon(android.R.drawable.stat_sys_data_bluetooth)
             .build()
 
         startForeground(1001, notification)
 
-        val crypto = CryptoEngine()
+        val crypto = CryptoEngine(applicationContext)
         bleMeshManager = BleMeshManager(applicationContext, crypto)
         bleMeshManager.startMesh()
     }

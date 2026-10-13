@@ -14,6 +14,7 @@ import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
@@ -81,7 +82,7 @@ class MainActivity : ComponentActivity() {
                     val manager = meshManager
                     if (manager == null) {
                         Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-                            Text("Starting Offline BLE Mesh & E2EE Engine...", color = Color.White)
+                            Text("Starting BitMesh...", color = Color.White)
                         }
                     } else {
                         BitMeshScreen(
@@ -150,15 +151,69 @@ fun BitMeshScreen(
     val peers by manager.peers.collectAsState()
     val messages by manager.messages.collectAsState()
     val stats by manager.meshStats.collectAsState()
+    val myNickname by manager.myNicknameFlow.collectAsState()
 
     var selectedPeer by remember { mutableStateOf<PeerNode?>(null) }
     var inputText by remember { mutableStateOf("") }
+    var showRenameDialog by remember { mutableStateOf(false) }
+    var draftName by remember(myNickname) { mutableStateOf(myNickname) }
+
+    if (showRenameDialog) {
+        AlertDialog(
+            onDismissRequest = { showRenameDialog = false },
+            containerColor = Color(0xFF1F2937),
+            title = {
+                Text("Set Your Display Name", color = Color.White, fontWeight = FontWeight.Bold)
+            },
+            text = {
+                Column {
+                    Text(
+                        "Nearby and multi-hop peers will see this name instead of your Node ID:",
+                        color = Color(0xFFD1D5DB),
+                        fontSize = 13.sp
+                    )
+                    Spacer(modifier = Modifier.height(10.dp))
+                    OutlinedTextField(
+                        value = draftName,
+                        onValueChange = { draftName = it },
+                        singleLine = true,
+                        placeholder = { Text("Enter your name (e.g. Mansi, Rahul)", color = Color(0xFF9CA3AF)) },
+                        colors = OutlinedTextFieldDefaults.colors(
+                            focusedTextColor = Color.White,
+                            unfocusedTextColor = Color.White,
+                            cursorColor = Color(0xFF10B981),
+                            focusedBorderColor = Color(0xFF10B981),
+                            unfocusedBorderColor = Color(0xFF374151)
+                        )
+                    )
+                }
+            },
+            confirmButton = {
+                Button(
+                    onClick = {
+                        if (draftName.trim().isNotEmpty()) {
+                            manager.updateNickname(draftName)
+                        }
+                        showRenameDialog = false
+                    }
+                ) {
+                    Text("Save Name")
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { showRenameDialog = false }) {
+                    Text("Cancel", color = Color(0xFF9CA3AF))
+                }
+            }
+        )
+    }
 
     Column(
         modifier = Modifier
             .fillMaxSize()
             .padding(12.dp)
     ) {
+        // Top Status Card with Tap-to-Rename & Action Buttons
         Column(
             modifier = Modifier
                 .fillMaxWidth()
@@ -170,9 +225,16 @@ fun BitMeshScreen(
                 horizontalArrangement = Arrangement.SpaceBetween,
                 verticalAlignment = Alignment.CenterVertically
             ) {
-                Column(modifier = Modifier.weight(1f)) {
+                Column(
+                    modifier = Modifier
+                        .weight(1f)
+                        .clickable {
+                            draftName = myNickname
+                            showRenameDialog = true
+                        }
+                ) {
                     Text(
-                        text = "BITMESH // OFFLINE BLE E2EE",
+                        text = "BITMESH // $myNickname ✏️",
                         color = Color(0xFF10B981),
                         fontFamily = FontFamily.Monospace,
                         fontWeight = FontWeight.Bold,
@@ -180,7 +242,7 @@ fun BitMeshScreen(
                     )
                     Spacer(modifier = Modifier.height(2.dp))
                     Text(
-                        text = "$stats • Peers: ${peers.size}",
+                        text = "$stats • Peers: ${peers.size} • Tap name to edit",
                         color = Color(0xFFD1D5DB),
                         fontFamily = FontFamily.Monospace,
                         fontSize = 11.sp,
@@ -188,18 +250,27 @@ fun BitMeshScreen(
                         overflow = TextOverflow.Ellipsis
                     )
                 }
-                Spacer(modifier = Modifier.width(8.dp))
+                Spacer(modifier = Modifier.width(6.dp))
                 Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                     OutlinedButton(
+                        onClick = {
+                            draftName = myNickname
+                            showRenameDialog = true
+                        },
+                        contentPadding = PaddingValues(horizontal = 8.dp, vertical = 6.dp)
+                    ) {
+                        Text("Name", color = Color(0xFF34D399), fontSize = 11.sp)
+                    }
+                    OutlinedButton(
                         onClick = onRefreshMesh,
-                        contentPadding = PaddingValues(horizontal = 10.dp, vertical = 6.dp)
+                        contentPadding = PaddingValues(horizontal = 8.dp, vertical = 6.dp)
                     ) {
                         Text("Refresh", color = Color(0xFF34D399), fontSize = 11.sp)
                     }
                     Button(
                         onClick = onShareApk,
                         colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF2563EB)),
-                        contentPadding = PaddingValues(horizontal = 10.dp, vertical = 6.dp)
+                        contentPadding = PaddingValues(horizontal = 8.dp, vertical = 6.dp)
                     ) {
                         Text("Beam APK", color = Color.White, fontSize = 11.sp)
                     }
@@ -209,6 +280,7 @@ fun BitMeshScreen(
 
         Spacer(modifier = Modifier.height(8.dp))
 
+        // Nearby & Multi-Hop Peers Selector Strip
         Row(
             modifier = Modifier.fillMaxWidth(),
             horizontalArrangement = Arrangement.spacedBy(8.dp)
@@ -216,7 +288,7 @@ fun BitMeshScreen(
             FilterChip(
                 selected = selectedPeer == null,
                 onClick = { selectedPeer = null },
-                label = { Text("#general (Broadcast)", color = Color.White) }
+                label = { Text("#general (Everyone)", color = Color.White) }
             )
             peers.values.forEach { peer ->
                 FilterChip(
@@ -234,6 +306,7 @@ fun BitMeshScreen(
 
         Spacer(modifier = Modifier.height(8.dp))
 
+        // Chat Feed
         LazyColumn(
             modifier = Modifier
                 .weight(1f)
@@ -243,11 +316,11 @@ fun BitMeshScreen(
             verticalArrangement = Arrangement.spacedBy(6.dp)
         ) {
             items(messages) { msg ->
-                val badge = if (msg.isDirectEncrypted) "🔒 E2EE-DM" else msg.channel
+                val badge = if (msg.isDirectEncrypted) "🔒 Private" else msg.channel
                 val deliveryStatus = if (msg.isOutgoing) {
                     if (msg.isDeliveredAck) "You • Delivered ✓✓" else "You • Sent ⏳"
                 } else {
-                    "Received • ${msg.hops}-hop mesh"
+                    "Received • ${msg.hops} hop${if (msg.hops > 1) "s" else ""}"
                 }
                 Column(
                     modifier = Modifier
@@ -277,6 +350,7 @@ fun BitMeshScreen(
 
         Spacer(modifier = Modifier.height(8.dp))
 
+        // Clean Message Composer
         Row(
             modifier = Modifier.fillMaxWidth(),
             verticalAlignment = Alignment.CenterVertically
@@ -294,8 +368,8 @@ fun BitMeshScreen(
                 ),
                 placeholder = {
                     Text(
-                        if (selectedPeer == null) "Encrypted message to #general..."
-                        else "ECDH + AES-256-GCM DM to ${selectedPeer!!.nickname}...",
+                        if (selectedPeer == null) "Type your message here..."
+                        else "Type a message to ${selectedPeer!!.nickname}...",
                         color = Color(0xFF9CA3AF)
                     )
                 },
