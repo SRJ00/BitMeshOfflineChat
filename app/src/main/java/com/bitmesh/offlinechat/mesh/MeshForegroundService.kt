@@ -33,7 +33,7 @@ class MeshForegroundService : Service() {
 
         val notification = Notification.Builder(this, channelId)
             .setContentTitle("BitMesh Offline Mesh Active")
-            .setContentText("Relaying encrypted multi-hop Bluetooth packets")
+            .setContentText("Audio-safe BLE duty cycling • E2EE Mesh ready")
             .setSmallIcon(android.R.drawable.stat_sys_data_bluetooth)
             .build()
 

@@ -213,7 +213,6 @@ fun BitMeshScreen(
             .fillMaxSize()
             .padding(12.dp)
     ) {
-        // Top Status Card with Tap-to-Rename & Action Buttons
         Column(
             modifier = Modifier
                 .fillMaxWidth()
@@ -280,7 +279,6 @@ fun BitMeshScreen(
 
         Spacer(modifier = Modifier.height(8.dp))
 
-        // Nearby & Multi-Hop Peers Selector Strip
         Row(
             modifier = Modifier.fillMaxWidth(),
             horizontalArrangement = Arrangement.spacedBy(8.dp)
@@ -306,7 +304,6 @@ fun BitMeshScreen(
 
         Spacer(modifier = Modifier.height(8.dp))
 
-        // Chat Feed
         LazyColumn(
             modifier = Modifier
                 .weight(1f)
@@ -350,7 +347,6 @@ fun BitMeshScreen(
 
         Spacer(modifier = Modifier.height(8.dp))
 
-        // Clean Message Composer
         Row(
             modifier = Modifier.fillMaxWidth(),
             verticalAlignment = Alignment.CenterVertically

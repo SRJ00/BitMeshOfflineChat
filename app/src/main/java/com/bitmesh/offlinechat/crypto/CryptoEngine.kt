@@ -15,10 +15,6 @@ import javax.crypto.spec.GCMParameterSpec
 import javax.crypto.spec.PBEKeySpec
 import javax.crypto.spec.SecretKeySpec
 
-/**
- * End-to-End Encryption Engine for BitMesh Offline Chat (v1.4).
- * Persists the device's EC keypair in SharedPreferences so your Node ID stays consistent across app restarts.
- */
 class CryptoEngine(context: Context? = null) {
 
     companion object {

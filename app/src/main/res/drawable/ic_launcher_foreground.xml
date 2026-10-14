@@ -4,13 +4,11 @@
     android:height="108dp"
     android:viewportWidth="108"
     android:viewportHeight="108">
-    <!-- Mesh Network Edges -->
     <path
         android:strokeColor="#10B981"
         android:strokeWidth="3.2"
         android:strokeLineCap="round"
         android:pathData="M54,54 L54,28 M54,54 L31,69 M54,54 L77,69 M54,54 L77,39 M54,54 L31,39 M54,28 L77,39 M54,28 L31,39 M31,39 L31,69 M77,39 L77,69 M31,69 L77,69" />
-    <!-- Outer Nodes -->
     <path
         android:fillColor="#F9FAFB"
         android:pathData="M54,28m-4.5,0a4.5,4.5 0,1 1,9 0a4.5,4.5 0,1 1,-9 0" />
@@ -26,7 +24,6 @@
     <path
         android:fillColor="#F9FAFB"
         android:pathData="M31,39m-4.5,0a4.5,4.5 0,1 1,9 0a4.5,4.5 0,1 1,-9 0" />
-    <!-- Center Core Hub Node -->
     <path
         android:fillColor="#34D399"
         android:pathData="M54,54m-6.5,0a6.5,6.5 0,1 1,13 0a6.5,6.5 0,1 1,-13 0" />

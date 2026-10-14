@@ -2,13 +2,6 @@ package com.bitmesh.offlinechat.mesh
 
 import java.nio.ByteBuffer
 
-/**
- * Compact Binary Packet Format for Long-Distance BLE Mesh Multi-Hop Routing (v1.4).
- *
- * MAX_TTL is set to 64 hops (up from 7), allowing packets to jump across chains of up to 64
- * intermediate phones (spanning 1 km to 5+ km when sufficient nodes are in between).
- * Duplicate packets are suppressed by an 8,192-entry LRU packetId cache on every node.
- */
 data class MeshPacket(
     val version: Byte = 1,
     val packetType: Byte,
